@@ -1,7 +1,47 @@
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
+
+/**
+ * The stellar CLI template that generates each binding package ships a Buffer
+ * polyfill targeted at DOM runtimes:
+ *
+ *   if (typeof window !== "undefined") {
+ *     //@ts-ignore Buffer exists
+ *     window.Buffer = window.Buffer || Buffer;
+ *   }
+ *
+ * It relies on a `@ts-ignore` (failing strict type checks and linting) and is
+ * skipped entirely in edge/worker runtimes, where `window` does not exist.
+ * This is the exact string it emits, so regeneration can be normalized back
+ * deterministically.
+ */
+export const CLI_BUFFER_SHIM = `if (typeof window !== "undefined") {
+  //@ts-ignore Buffer exists
+  window.Buffer = window.Buffer || Buffer;
+}`;
+
+/**
+ * Typed, runtime-neutral replacement: Node, browsers, and edge isolates all
+ * share `globalThis`, and Node already defines `Buffer` there, so the guard
+ * only assigns in non-Node runtimes. No `@ts-ignore`, and the assignment
+ * targets the one object every runtime exposes — `window` is not consulted.
+ * Kept free of TypeScript-only syntax so the semantics can also be executed
+ * verbatim in an isolated runtime (see bindings-portability.test.ts).
+ */
+export const RUNTIME_NEUTRAL_BUFFER_SHIM = `if (typeof globalThis.Buffer === "undefined") {
+  globalThis.Buffer = Buffer;
+}`;
+
+/**
+ * Rewrites the stellar CLI's window-targeted Buffer polyfill into the typed,
+ * runtime-neutral form. Applied on every generated file so the checked-in
+ * bindings stay byte-reproducible with `pnpm bindings:stellar`.
+ */
+export function normalizeBufferRuntimeSource(content: string): string {
+  return content.replaceAll(CLI_BUFFER_SHIM, RUNTIME_NEUTRAL_BUFFER_SHIM);
+}
 
 // Define paths
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -88,6 +128,28 @@ function loadConfig(): Record<string, string> {
     }
   }
   return {};
+}
+
+// Walk generated output and normalize the runtime Buffer polyfill.
+function normalizeBufferRuntime(directory: string): void {
+  if (!fs.existsSync(directory)) return;
+
+  const files = fs.readdirSync(directory);
+  for (const file of files) {
+    const fullPath = path.join(directory, file);
+    const stat = fs.statSync(fullPath);
+
+    if (stat.isDirectory()) {
+      normalizeBufferRuntime(fullPath);
+    } else if (file.endsWith('.ts') || file.endsWith('.js')) {
+      const content = fs.readFileSync(fullPath, 'utf8');
+      const normalized = normalizeBufferRuntimeSource(content);
+      if (normalized !== content) {
+        fs.writeFileSync(fullPath, normalized, 'utf8');
+        console.log(`🧩 Normalized runtime Buffer polyfill: ${path.relative(STELLAR_DIR, fullPath)}`);
+      }
+    }
+  }
 }
 
 // Post-process generated files to convert default exports to named exports
@@ -251,8 +313,10 @@ async function main() {
       execSync(command, { cwd: STELLAR_DIR, stdio: 'inherit' });
       console.log(`✅ Generated bindings for ${contract.crateName}.`);
 
-      // Post-process output to use named exports
+      // Post-process output to use named exports, then normalize the
+      // window-targeted Buffer polyfill the CLI template emits.
       postProcessBindings(outputDir);
+      normalizeBufferRuntime(outputDir);
     } catch (err) {
       console.error(`❌ Failed to generate bindings for ${contract.crateName}:`, err);
       process.exit(1);
@@ -285,7 +349,11 @@ export * as Governance from './governance/src/index';
   console.log('\n🎉 All bindings generated and post-processed successfully!');
 }
 
-main().catch((err) => {
-  console.error('❌ Script failed with error:', err);
-  process.exit(1);
-});
+// Run only when executed directly; importing this module from tests must not
+// regenerate anything.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error('❌ Script failed with error:', err);
+    process.exit(1);
+  });
+}

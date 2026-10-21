@@ -1,5 +1,7 @@
 #![no_std]
 
+mod ed25519;
+
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, BytesN, Env};
 
 /// Stellar v2 deployment scheme id.
@@ -69,6 +71,10 @@ impl StealthAnnouncerContract {
         metadata: Bytes,
     ) {
         assert_eq!(scheme_id, STELLAR_V2_SCHEME_ID);
+        assert!(
+            ed25519::is_valid_ed25519_public_key(&ephemeral_pub_key.to_array()),
+            "invalid ed25519 ephemeral public key"
+        );
 
         let view_tag_bucket = view_tag_bucket(&metadata);
         let metadata_kind = METADATA_KIND_VIEW_TAG;
@@ -98,7 +104,7 @@ mod test {
         let client = StealthAnnouncerContractClient::new(&env, &contract_id);
 
         let stealth_address = Address::generate(&env);
-        let ephemeral_pub_key = BytesN::from_array(&env, &[1u8; 32]);
+        let ephemeral_pub_key = BytesN::from_array(&env, &[0x06u8; 32]);
         let metadata = Bytes::from_slice(&env, &[42u8, 7u8]);
         let scheme_id: u32 = STELLAR_V2_SCHEME_ID;
 
@@ -134,7 +140,7 @@ mod test {
         let client = StealthAnnouncerContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let epk = BytesN::from_array(&env, &[1u8; 32]);
+        let epk = BytesN::from_array(&env, &[0x06u8; 32]);
         let first_meta = Bytes::from_slice(&env, &[0u8, 99u8]);
         let second_meta = Bytes::from_slice(&env, &[255u8, 99u8]);
 
@@ -175,7 +181,7 @@ mod test {
         let client = StealthAnnouncerContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let epk = BytesN::from_array(&env, &[1u8; 32]);
+        let epk = BytesN::from_array(&env, &[0x06u8; 32]);
         let meta = Bytes::from_slice(&env, &[0u8; 1]);
 
         client.announce(&1u32, &addr, &epk, &meta);
@@ -191,7 +197,7 @@ mod test {
         let client = StealthAnnouncerContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let epk = BytesN::from_array(&env, &[1u8; 32]);
+        let epk = BytesN::from_array(&env, &[0x06u8; 32]);
         let meta = Bytes::new(&env);
 
         client.announce(&STELLAR_V2_SCHEME_ID, &addr, &epk, &meta);

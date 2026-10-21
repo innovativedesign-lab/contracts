@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { parse as parseYaml } from 'yaml';
+import { canonicalAbiSha256 } from '../src/hash.js';
 
 const run = promisify(execFile);
 const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -16,7 +18,7 @@ const FIXTURE_PATHS = [
   'deployments',
   'README.md',
   'evm/hardhat.config.ts',
-  'evm/subgraph/subgraph.yaml',
+  'evm/subgraph/subgraph.template.yaml',
   'evm/subgraph/abis',
   'evm/subgraph/horizen-testnet',
   'solana/Anchor.toml',
@@ -26,6 +28,11 @@ const FIXTURE_PATHS = [
   'ckb/testnet.toml',
   'stellar/contract-ids.json',
 ];
+
+type Record_Contract = {
+  deployment: { txHash: string | null };
+  abi?: unknown;
+};
 
 let root: string;
 
@@ -67,18 +74,18 @@ describe('check', () => {
 
   it.each([
     [
-      'subgraph address',
-      'evm/subgraph/subgraph.yaml',
-      '0x8AE65c05E7eb48B9bA652781Bc0a3DBA09A484F3',
-      '0x8AE65c05E7eb48B9bA652781Bc0a3DBA09A48400',
-      /subgraph\.yaml dataSource ERC5564Announcer: address/,
+      'subgraph template address',
+      'evm/subgraph/subgraph.template.yaml',
+      '      abi: WraithNames',
+      "      address: '0x000000000000000000000000000000000000dead'\n      abi: WraithNames",
+      /subgraph\.template\.yaml: dataSource WraithNames: source\.address is set/,
     ],
     [
-      'subgraph start block',
-      'evm/subgraph/subgraph.yaml',
-      'startBlock: 14202905',
-      'startBlock: 1',
-      /startBlock 1, manifest height is 14202905/,
+      'subgraph template contract',
+      'evm/subgraph/subgraph.template.yaml',
+      '      abi: WraithSender',
+      '      abi: WraithRouter',
+      /dataSource WraithSender: source\.abi WraithRouter is not one of the EVM contracts/,
     ],
     [
       'instant config',
@@ -137,6 +144,74 @@ describe('check', () => {
     expect(code).toBe(1);
   });
 
+  describe('EVM coverage', () => {
+    const RECORD = 'deployments/evm/horizen-testnet.json';
+    type Record = { contracts: unknown[]; undeployed?: Array<{ name: string; reason: string }> };
+    const change = (fn: (record: Record) => void) => {
+      const file = path.join(root, RECORD);
+      const record: Record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      fn(record);
+      fs.writeFileSync(file, JSON.stringify(record, null, 2));
+    };
+
+    it('records the two deployed contracts and marks the other three undeployed', () => {
+      const record: Record = JSON.parse(fs.readFileSync(path.join(root, RECORD), 'utf8'));
+      expect(record.contracts).toHaveLength(2);
+      expect(record.undeployed?.map((u) => u.name).sort()).toEqual([
+        'WraithNames',
+        'WraithSender',
+        'WraithWithdrawer',
+      ]);
+    });
+
+    it('fails when a supported contract is neither recorded nor marked undeployed', async () => {
+      change((record) => {
+        record.undeployed = record.undeployed!.filter((u) => u.name !== 'WraithNames');
+      });
+      const { code, output } = await cli('check');
+      expect(output).toMatch(/horizen-testnet\.json: \/contracts WraithNames has no record/);
+      expect(output).not.toMatch(/WraithSender has no record|WraithWithdrawer has no record/);
+      expect(code).toBe(1);
+    });
+
+    it('fails when no contract is marked undeployed and three are missing', async () => {
+      change((record) => delete record.undeployed);
+      const { code, output } = await cli('check');
+      for (const name of ['WraithSender', 'WraithNames', 'WraithWithdrawer']) {
+        expect(output).toContain(`${name} has no record`);
+      }
+      expect(code).toBe(1);
+    });
+
+    it('fails when a contract is marked undeployed that is also recorded', async () => {
+      change((record) =>
+        record.undeployed!.push({ name: 'ERC5564Announcer', reason: 'wrongly listed' }),
+      );
+      const { code, output } = await cli('check');
+      expect(output).toMatch(/\(ERC5564Announcer\) is also recorded under contracts/);
+      expect(code).toBe(1);
+    });
+
+    it('fails when a recorded EVM contract has no transaction hash or no ABI', async () => {
+      change((record) => {
+        const [first, second] = record.contracts as Array<Record_Contract>;
+        first.deployment.txHash = null;
+        delete second.abi;
+      });
+      const { code, output } = await cli('check');
+      expect(output).toMatch(/ERC5564Announcer\) deployment\.txHash is required/);
+      expect(output).toMatch(/ERC6538Registry\) abi is required/);
+      expect(code).toBe(1);
+    });
+
+    it('refuses to build while a supported contract has no record', async () => {
+      change((record) => delete record.undeployed);
+      const { code, output } = await cli('build');
+      expect(output).toContain('WraithNames has no record');
+      expect(code).toBe(1);
+    });
+  });
+
   it('fails when a record changes without rebuilding the manifest', async () => {
     edit('deployments/solana/solana-devnet.json', '"height": 456215445', '"height": 456215446');
     const { code, output } = await cli('check');
@@ -169,6 +244,7 @@ describe('build', () => {
           id: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
           version: '0.1.0',
           sourceCommit: 'a'.repeat(40),
+          provenance: { status: 'source-verified' },
           artifactHash: { algorithm: 'sha256', value: `0x${'11'.repeat(32)}` },
           deployment: { height: 123, txHash: null, deployer: null, timestamp: null },
         },
@@ -205,5 +281,216 @@ describe('build', () => {
     const { code, output } = await cli('build');
     expect(output).toMatch(/networkId/);
     expect(code).toBe(1);
+  });
+});
+
+describe('subgraph', () => {
+  const RECORD = 'deployments/evm/horizen-testnet.json';
+  const TEMPLATE = 'evm/subgraph/subgraph.template.yaml';
+  const GENERATED = 'evm/subgraph/subgraph.yaml';
+
+  // The three contracts horizen-testnet does not record yet, with made-up
+  // addresses and blocks. They only ever live in the temporary fixture.
+  const missing = [
+    { name: 'WraithNames', id: `0x${'1'.repeat(40)}`, height: 14300000 },
+    { name: 'WraithSender', id: `0x${'2'.repeat(40)}`, height: 14300001 },
+    { name: 'WraithWithdrawer', id: `0x${'3'.repeat(40)}`, height: 14300002 },
+  ];
+
+  type EvmRecord = {
+    network: string;
+    contracts: Array<{ name: string; id: string; deployment: { height?: number } }>;
+    undeployed?: unknown;
+  };
+  const readJson = (rel: string) => JSON.parse(fs.readFileSync(path.join(root, rel), 'utf8'));
+  const readYaml = (rel: string) => parseYaml(fs.readFileSync(path.join(root, rel), 'utf8'));
+  const generated = () => fs.existsSync(path.join(root, GENERATED));
+
+  function recordAll(change?: (record: EvmRecord) => void) {
+    const record: EvmRecord = readJson(RECORD);
+    for (const { name, id, height } of missing) {
+      const abiPath = `evm/subgraph/abis/${name}.json`;
+      record.contracts.push({
+        name,
+        id,
+        version: null,
+        sourceCommit: null,
+        provenance: { status: 'unverifiable', reason: 'test fixture' },
+        artifactHash: { algorithm: 'keccak256', value: `0x${'00'.repeat(32)}` },
+        abi: {
+          path: abiPath,
+          sha256: canonicalAbiSha256(
+            JSON.parse(fs.readFileSync(path.join(repoRoot, abiPath), 'utf8')),
+          ),
+        },
+        deployment: { height, txHash: `0x${'44'.repeat(32)}` },
+      } as EvmRecord['contracts'][number]);
+    }
+    // Recorded now, so no longer undeployed.
+    delete record.undeployed;
+    change?.(record);
+    fs.writeFileSync(path.join(root, RECORD), JSON.stringify(record, null, 2));
+    return record;
+  }
+
+  it('refuses the checked-in horizen-testnet record, naming the three contracts it lacks', async () => {
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    for (const name of ['WraithNames', 'WraithSender', 'WraithWithdrawer']) {
+      expect(output).toContain(`${name}: not recorded in ${RECORD}`);
+    }
+    expect(output).not.toMatch(/ERC5564Announcer|ERC6538Registry/);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it('fills network, address and start block from a record with every contract', async () => {
+    const record = recordAll();
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    expect(output).toContain(`✓ ${GENERATED} for horizen-testnet`);
+    expect(code).toBe(0);
+
+    const template = readYaml(TEMPLATE);
+    const manifest = readYaml(GENERATED);
+    expect(manifest.dataSources).toHaveLength(5);
+    manifest.dataSources.forEach((ds: any, i: number) => {
+      const contract = record.contracts.find((c) => c.name === ds.source.abi)!;
+      expect(ds.network).toBe('horizen-testnet');
+      expect(ds.source.address).toBe(contract.id);
+      expect(ds.source.startBlock).toBe(contract.deployment.height);
+      // Nothing else differs from the template.
+      const { network: _n, ...rest } = ds;
+      const { address: _a, startBlock: _s, ...source } = ds.source;
+      expect({ ...rest, source }).toEqual(template.dataSources[i]);
+    });
+    expect({ ...manifest, dataSources: [] }).toEqual({ ...template, dataSources: [] });
+    expect(manifest.dataSources.map((ds: any) => ds.source.startBlock)).toEqual([
+      14202900, 14202905, 14300000, 14300001, 14300002,
+    ]);
+    expect(fs.readFileSync(path.join(root, GENERATED), 'utf8')).toMatch(
+      /^# Generated from subgraph\.template\.yaml and deployments\/evm\/horizen-testnet\.json/,
+    );
+  });
+
+  it.each([
+    ['has no start block', (c: EvmRecord['contracts'][number]) => delete c.deployment.height],
+    ['has start block 0', (c: EvmRecord['contracts'][number]) => (c.deployment.height = 0)],
+  ])('fails when a contract %s', async (_label, change) => {
+    recordAll((record) => change(record.contracts.find((c) => c.name === 'WraithSender')!));
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    expect(output).toMatch(/WraithSender: (no start block|start block 0)/);
+    expect(output).not.toMatch(/WraithNames|WraithWithdrawer/);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it('fails when a contract has the placeholder address', async () => {
+    recordAll((record) => {
+      record.contracts.find((c) => c.name === 'WraithNames')!.id =
+        '0x000000000000000000000000000000000000dEaD';
+    });
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    expect(output).toMatch(/WraithNames: .* has the placeholder address/);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it('fails for a network without a deployment record', async () => {
+    const { code, output } = await cli('subgraph', '--network', 'base-sepolia');
+    expect(output).toContain(
+      'no deployment record deployments/evm/base-sepolia.json (recorded EVM networks: horizen-testnet)',
+    );
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it('--check passes only while the generated manifest matches the template and record', async () => {
+    const none = await cli('subgraph', '--check');
+    expect(none.output).toMatch(/subgraph\.yaml has not been generated/);
+    expect(none.code).toBe(1);
+
+    recordAll();
+    expect((await cli('subgraph', '--network', 'horizen-testnet')).code).toBe(0);
+    const ok = await cli('subgraph', '--check');
+    expect(ok.output).toContain(`✓ ${GENERATED} is current for horizen-testnet`);
+    expect(ok.code).toBe(0);
+
+    edit(GENERATED, 'startBlock: 14300001', 'startBlock: 1');
+    const edited = await cli('subgraph', '--check');
+    expect(edited.output).toMatch(/subgraph\.yaml differs from/);
+    expect(edited.code).toBe(1);
+
+    // A record that loses a contract after generation blocks the deploy too.
+    expect((await cli('subgraph', '--network', 'horizen-testnet')).code).toBe(0);
+    fs.cpSync(path.join(repoRoot, RECORD), path.join(root, RECORD));
+    const stale = await cli('subgraph', '--check');
+    expect(stale.output).toContain(`WraithWithdrawer: not recorded in ${RECORD}`);
+    expect(stale.code).toBe(1);
+  });
+
+  it('--check refuses a manifest whose data sources name more than one network', async () => {
+    recordAll();
+    expect((await cli('subgraph', '--network', 'horizen-testnet')).code).toBe(0);
+    edit(GENERATED, 'network: horizen-testnet', 'network: base-sepolia');
+    const { code, output } = await cli('subgraph', '--check');
+    expect(output).toMatch(/subgraph\.yaml does not name exactly one network/);
+    expect(code).toBe(1);
+  });
+
+  it('lists every problem of a contract, not only the first', async () => {
+    recordAll((record) => {
+      const names = record.contracts.find((c) => c.name === 'WraithNames')!;
+      names.deployment.height = 0;
+      names.id = '0x000000000000000000000000000000000000dEaD';
+    });
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    expect(output).toMatch(/WraithNames: start block 0/);
+    expect(output).toMatch(/WraithNames: .* has the placeholder address/);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it('reports a record that fails validation and writes nothing', async () => {
+    recordAll((record) => {
+      record.network = 'base-sepolia';
+    });
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    expect(output).toContain(`${RECORD}: network "base-sepolia" does not match file name`);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it('reports a record that is not a JSON object', async () => {
+    fs.writeFileSync(path.join(root, RECORD), 'null');
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    expect(output).toContain(`${RECORD}: not a JSON object`);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it('refuses a template with dynamic data source templates', async () => {
+    recordAll();
+    fs.appendFileSync(
+      path.join(root, TEMPLATE),
+      '\ntemplates:\n  - kind: ethereum\n    name: Dynamic\n    source:\n      abi: WraithNames\n',
+    );
+    const { code, output } = await cli('subgraph', '--network', 'horizen-testnet');
+    expect(output).toMatch(/has templates \(dynamic data sources\)/);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
+  });
+
+  it.each([
+    ['a network that is not a slug', ['--network', '../horizen-testnet'], /is not a network slug/],
+    ['neither --network nor --check', [], /subgraph takes either --network <slug> or --check/],
+    [
+      'both --network and --check',
+      ['--network', 'horizen-testnet', '--check'],
+      /subgraph takes either --network <slug> or --check/,
+    ],
+  ])('refuses %s', async (_label, args, message) => {
+    const { code, output } = await cli('subgraph', ...args);
+    expect(output).toMatch(message);
+    expect(code).toBe(1);
+    expect(generated()).toBe(false);
   });
 });

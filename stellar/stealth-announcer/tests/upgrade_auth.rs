@@ -54,7 +54,7 @@ fn test_no_upgrade_function_exists() {
 
     // Verify the contract only has the announce function
     let addr = Address::generate(&env);
-    let epk = BytesN::from_array(&env, &[1u8; 32]);
+    let epk = BytesN::from_array(&env, &[0x06u8; 32]);
     let meta = Bytes::from_slice(&env, &[42u8, 7u8]);
 
     // This should work (normal operation)
@@ -96,18 +96,19 @@ fn test_frozen_contract_fully_functional() {
 
     // Test normal operation
     let addr1 = Address::generate(&env);
-    let epk1 = BytesN::from_array(&env, &[1u8; 32]);
+    let epk1 = BytesN::from_array(&env, &[0x06u8; 32]);
     let meta1 = Bytes::from_slice(&env, &[100u8, 1u8]);
 
     client.announce(&STELLAR_V2_SCHEME_ID, &addr1, &epk1, &meta1);
 
     // Test multiple announcements
-    for i in 0..10 {
+    const VALID_EPK_FILLS: [u8; 14] = [
+        0x06, 0x19, 0x1a, 0x1d, 0x35, 0x4c, 0x7b, 0x81, 0x83, 0x8f, 0x97, 0xa7, 0xd6, 0xe2,
+    ];
+    for (i, fill) in VALID_EPK_FILLS.iter().enumerate() {
         let addr = Address::generate(&env);
-        let mut epk_bytes = [2u8; 32];
-        epk_bytes[0] = i;
-        let epk = BytesN::from_array(&env, &epk_bytes);
-        let meta = Bytes::from_slice(&env, &[i, 2u8]);
+        let epk = BytesN::from_array(&env, &[*fill; 32]);
+        let meta = Bytes::from_slice(&env, &[i as u8, 2u8]);
 
         client.announce(&STELLAR_V2_SCHEME_ID, &addr, &epk, &meta);
     }
@@ -147,7 +148,7 @@ fn test_immutability_documented() {
     // Verify the contract works exactly as designed
     let client = StealthAnnouncerContractClient::new(&env, &contract_id);
     let addr = Address::generate(&env);
-    let epk = BytesN::from_array(&env, &[255u8; 32]);
+    let epk = BytesN::from_array(&env, &[0x19u8; 32]);
     let meta = Bytes::from_slice(&env, &[128u8, 255u8]);
 
     client.announce(&STELLAR_V2_SCHEME_ID, &addr, &epk, &meta);
@@ -183,7 +184,7 @@ fn test_behavior_deterministic_and_unchanging() {
 
     // Test same inputs always produce same outputs/events
     let addr = Address::generate(&env);
-    let epk = BytesN::from_array(&env, &[42u8; 32]);
+    let epk = BytesN::from_array(&env, &[0x1au8; 32]);
     let meta = Bytes::from_slice(&env, &[10u8, 20u8]);
 
     // First call

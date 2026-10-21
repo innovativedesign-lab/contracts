@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -6,15 +5,19 @@ import { CONSUMERS } from './consumers.js';
 import {
   buildManifest,
   loadRecords,
+  readRecord,
   readManifest,
   serialize,
+  coverageErrors,
   validateDeployment,
   validateManifest,
   type Chain,
   type Contract,
   type Deployment,
+  type Undeployed,
 } from './manifest.js';
-import { MANIFEST_PATH, REPO_ROOT, recordPath } from './paths.js';
+import { MANIFEST_PATH, REPO_ROOT, recordPath, repoPath } from './paths.js';
+import { SourceSession, candidateCommits, dirtyFiles, resolveSourceCommit } from './provenance.js';
 import { ckbNetworkId, recordCkbScript } from './record/ckb.js';
 import { evmNetworkId, recordEvmContract } from './record/evm.js';
 import { recordSolanaProgram, solanaNetworkId } from './record/solana.js';
@@ -24,6 +27,12 @@ import {
   stellarNetworkId,
   wasmHashFromInstanceEntry,
 } from './record/stellar.js';
+import {
+  generateSubgraph,
+  generatedNetwork,
+  SUBGRAPH_MANIFEST,
+  SUBGRAPH_TEMPLATE,
+} from './subgraph.js';
 
 const USAGE = `Usage: tsx src/cli.ts <command>
 
@@ -34,6 +43,13 @@ const USAGE = `Usage: tsx src/cli.ts <command>
             consumer disagrees with it. Offline; this is what CI runs.
   verify    Re-read every deployment from its chain and compare IDs, heights and
             artifact hashes. Needs network access.
+  subgraph --network <slug>
+            Write evm/subgraph/subgraph.yaml from evm/subgraph/subgraph.template.yaml
+            and deployments/evm/<slug>.json. Fails, naming each one, if a contract
+            the template indexes or its start block is not recorded.
+  subgraph --check
+            Fail unless evm/subgraph/subgraph.yaml is what --network would write now
+            for the network it names. The evm/subgraph deploy scripts run it first.
   record <evm|stellar|solana|ckb> --network <slug> --rpc <https-url> [targets...]
             Read deployments from the chain and write deployments/<chain>/<network>.json,
             merging with any existing record, then run build.
@@ -41,10 +57,25 @@ const USAGE = `Usage: tsx src/cli.ts <command>
     stellar  --contract name=CContractId --wasm name=path/to.wasm [--deployer G...]
     solana   --program name=ProgramId
     ckb      --script name=0xTxHash:index:hashType[:external]
+    evm      --undeployed Name=reason   mark a supported contract as not deployed on
+                                        this network (repeatable). Recording a contract
+                                        removes it from the undeployed list.
     common   --recorded-by deploy-script|chain-query  --source-commit <sha|HEAD>
              --version <semver> | --version name=<semver>   (repeatable)
              --public-rpc <https-url>   stored as rpcUrl for \`verify\`. --rpc is never
                                         stored, so it may carry an API key.
+             --unverifiable-reason <text>   why no source commit is recorded
+            deploy-script records need --source-commit (HEAD or a full hash), a clean
+            working tree, and a build of that commit that reproduces the artifact hash.
+  verify-source [--chain <chain>] [--network <slug>] [--contract <name>]
+            Rebuild every source-verified contract from its recorded commit and fail
+            unless the build reproduces the recorded artifact hash. Needs the chain's
+            toolchain (and network access for EVM contracts with immutables).
+  attest <evm|stellar|solana|ckb> --network <slug> --contract <name>
+         (--commit <full-sha> | --search [--max <n>])
+            Backfill: if building the commit reproduces the recorded artifact hash,
+            record it as source-verified. --search tries the commits that touched the
+            chain's sources before the deployment, newest first.
 `;
 
 const userPath = (p: string) => path.resolve(process.env.INIT_CWD ?? process.cwd(), p);
@@ -93,12 +124,16 @@ function check(): void {
     }
     for (const consumer of CONSUMERS) problems.push(...consumer.check(manifest));
 
-    const unknown = manifest.deployments.flatMap((d) =>
+    const unverifiable = manifest.deployments.flatMap((d) =>
       d.contracts
-        .filter((c) => !c.sourceCommit && !c.external)
+        .filter((c) => c.provenance?.status === 'unverifiable')
         .map((c) => `${d.network}/${c.name}`),
     );
-    if (unknown.length) console.log(`ℹ source commit not recorded for: ${unknown.join(', ')}`);
+    if (unverifiable.length) {
+      console.log(
+        `ℹ unverifiable historical records (source commit unproven): ${unverifiable.join(', ')}`,
+      );
+    }
   }
   if (problems.length) {
     console.error(`Deployment manifest check failed (${problems.length}):`);
@@ -107,6 +142,48 @@ function check(): void {
   console.log(
     `✓ manifest valid; ${records.length} deployments; ${CONSUMERS.length} consumers agree`,
   );
+}
+
+function subgraph(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: { network: { type: 'string' }, check: { type: 'boolean', default: false } },
+  });
+  if (values.check === Boolean(values.network)) {
+    throw new Error('subgraph takes either --network <slug> or --check');
+  }
+  const out = repoPath(SUBGRAPH_MANIFEST);
+
+  if (values.network) {
+    const { manifest, errors } = generateSubgraph(values.network);
+    if (manifest === null) {
+      console.error(`Cannot generate ${SUBGRAPH_MANIFEST} for ${values.network}:`);
+      fail(errors);
+    }
+    fs.writeFileSync(out, manifest);
+    console.log(`✓ ${SUBGRAPH_MANIFEST} for ${values.network}`);
+    return;
+  }
+
+  if (!fs.existsSync(out)) {
+    fail([
+      `${SUBGRAPH_MANIFEST} has not been generated (run \`npm run manifest -- --network <network>\` in evm/subgraph)`,
+    ]);
+  }
+  const current = fs.readFileSync(out, 'utf8');
+  const network = generatedNetwork(current);
+  if (!network) fail([`${SUBGRAPH_MANIFEST} does not name exactly one network; regenerate it`]);
+  const { manifest, errors } = generateSubgraph(network);
+  if (manifest === null) {
+    console.error(`${SUBGRAPH_MANIFEST} can no longer be generated for ${network}:`);
+    fail(errors);
+  }
+  if (manifest !== current) {
+    fail([
+      `${SUBGRAPH_MANIFEST} differs from ${SUBGRAPH_TEMPLATE} and deployments/evm/${network}.json (run \`npm run manifest -- --network ${network}\`)`,
+    ]);
+  }
+  console.log(`✓ ${SUBGRAPH_MANIFEST} is current for ${network}`);
 }
 
 type TargetArgs = Partial<
@@ -177,10 +254,12 @@ async function record(chain: Chain, argv: string[]): Promise<void> {
       wasm: { type: 'string', multiple: true },
       abi: { type: 'string', multiple: true },
       deployer: { type: 'string', multiple: true },
+      undeployed: { type: 'string', multiple: true },
       'recorded-by': { type: 'string', default: 'chain-query' },
       'source-commit': { type: 'string' },
       version: { type: 'string', multiple: true },
       'public-rpc': { type: 'string' },
+      'unverifiable-reason': { type: 'string' },
     },
   });
   if (!values.network || !values.rpc) throw new Error('--network and --rpc are required');
@@ -196,20 +275,25 @@ async function record(chain: Chain, argv: string[]): Promise<void> {
     );
   }
 
-  let sourceCommit = values['source-commit'] ?? null;
-  if (sourceCommit === 'HEAD') {
-    sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: REPO_ROOT,
-      encoding: 'utf8',
-    }).trim();
-    const dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], {
-      cwd: REPO_ROOT,
-      encoding: 'utf8',
-    });
-    if (dirty.trim())
-      console.warn(
-        '⚠ working tree has uncommitted changes; sourceCommit may not match the deployed code',
+  const recordedBy = values['recorded-by'] as Deployment['recordedBy'];
+  if (recordedBy !== 'deploy-script' && recordedBy !== 'chain-query') {
+    throw new Error(`--recorded-by must be deploy-script or chain-query, got "${recordedBy}"`);
+  }
+  let sourceCommit: string | null = null;
+  if (values['source-commit'] !== undefined) {
+    sourceCommit = resolveSourceCommit(values['source-commit']);
+  } else if (recordedBy === 'deploy-script') {
+    throw new Error(
+      'records written by a deploy script need --source-commit (HEAD or a full hash)',
+    );
+  }
+  if (sourceCommit && recordedBy === 'deploy-script') {
+    const dirty = dirtyFiles();
+    if (dirty.length) {
+      throw new Error(
+        `working tree has uncommitted changes, so ${sourceCommit} is not what was built:\n${dirty.join('\n')}`,
       );
+    }
   }
 
   const versions = new Map<string, string>();
@@ -221,14 +305,55 @@ async function record(chain: Chain, argv: string[]): Promise<void> {
 
   const recorded = await recordContracts(chain, values.rpc, values, existing);
   const contracts = new Map((existing?.contracts ?? []).map((c) => [c.name, c]));
-  for (const { name, id, ...rest } of recorded) {
-    contracts.set(name, {
-      name,
-      id,
-      version: rest.external ? null : (versions.get(name) ?? defaultVersion),
-      sourceCommit: rest.external ? null : sourceCommit,
-      ...rest,
-    });
+  const session = new SourceSession();
+  const unproven: string[] = [];
+  try {
+    for (const { name, id, ...rest } of recorded) {
+      if (rest.external) {
+        contracts.set(name, { name, id, version: null, sourceCommit: null, ...rest });
+        continue;
+      }
+      const previous = contracts.get(name);
+      const sameArtifact = previous?.artifactHash.value === rest.artifactHash.value;
+      const version =
+        versions.get(name) ?? defaultVersion ?? (sameArtifact ? previous!.version : null);
+      let commit = sourceCommit;
+      let provenance: Contract['provenance'];
+      if (commit) {
+        const why = await session.check(
+          chain,
+          { name, id, sourceCommit: commit, ...rest },
+          values.rpc,
+        );
+        if (why) unproven.push(`${name}: ${why}`);
+        provenance = { status: 'source-verified' };
+      } else if (sameArtifact && previous?.provenance) {
+        // Same bytes as before: what was proven about them still holds.
+        commit = previous.sourceCommit;
+        provenance = previous.provenance;
+      } else {
+        provenance = {
+          status: 'unverifiable',
+          reason:
+            values['unverifiable-reason'] ??
+            'Recorded from chain state without a source commit; no build has been shown to reproduce the artifact hash.',
+        };
+      }
+      contracts.set(name, { name, id, version, sourceCommit: commit, provenance, ...rest });
+    }
+  } finally {
+    session.dispose();
+  }
+  if (unproven.length) fail(unproven.map((u) => `source commit does not reproduce: ${u}`));
+
+  const recordedNames = new Set(recorded.map((c) => c.name));
+  const undeployed = new Map<string, Undeployed>(
+    (existing?.undeployed ?? []).filter((u) => !recordedNames.has(u.name)).map((u) => [u.name, u]),
+  );
+  for (const [name, reason] of pairs(values.undeployed, '--undeployed')) {
+    if (recordedNames.has(name))
+      throw new Error(`${name} cannot be both recorded and --undeployed`);
+    undeployed.set(name, { name, reason });
   }
 
   const deployment: Deployment = {
@@ -238,19 +363,27 @@ async function record(chain: Chain, argv: string[]): Promise<void> {
     ...((values['public-rpc'] ?? existing?.rpcUrl)
       ? { rpcUrl: values['public-rpc'] ?? existing?.rpcUrl }
       : {}),
-    recordedBy: values['recorded-by'] as Deployment['recordedBy'],
+    recordedBy,
     contracts: [...contracts.values()],
+    ...(undeployed.size ? { undeployed: [...undeployed.values()] } : {}),
   };
   const errors = validateDeployment(deployment);
+  if (!errors.length) errors.push(...coverageErrors(deployment));
   if (errors.length) fail(errors);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, serialize(deployment));
-  console.log(`✓ ${path.relative(REPO_ROOT, file)}: ${recorded.map((c) => c.name).join(', ')}`);
+  console.log(
+    `✓ ${path.relative(REPO_ROOT, file)}: ${recorded.map((c) => c.name).join(', ') || 'no new contracts'}` +
+      (undeployed.size ? ` (undeployed: ${[...undeployed.keys()].join(', ')})` : ''),
+  );
   build();
 }
 
 async function verify(): Promise<void> {
   const manifest = readManifest();
+  // Every supported contract must have an explicit record before anything is read from a chain.
+  const invalid = validateManifest(manifest);
+  if (invalid.length) fail(invalid);
   const problems: string[] = [];
   for (const d of manifest.deployments) {
     if (!d.rpcUrl) {
@@ -310,11 +443,116 @@ async function verify(): Promise<void> {
   console.log('✓ every deployment matches its chain');
 }
 
+async function verifySource(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      chain: { type: 'string' },
+      network: { type: 'string' },
+      contract: { type: 'string' },
+    },
+  });
+  const manifest = readManifest();
+  const session = new SourceSession();
+  const problems: string[] = [];
+  let checked = 0;
+  try {
+    for (const d of manifest.deployments) {
+      if (values.chain && d.chain !== values.chain) continue;
+      if (values.network && d.network !== values.network) continue;
+      for (const c of d.contracts) {
+        if (c.external || (values.contract && c.name !== values.contract)) continue;
+        const where = `${d.network}/${c.name}`;
+        if (c.provenance?.status !== 'source-verified') {
+          console.log(
+            `- ${where}: unverifiable historical record, skipped (${c.provenance?.reason ?? 'no provenance'})`,
+          );
+          continue;
+        }
+        checked++;
+        const why = await session.check(d.chain, c, d.rpcUrl);
+        if (why) problems.push(`${where}: ${why}`);
+        else console.log(`✓ ${where}: ${c.sourceCommit} reproduces ${c.artifactHash.value}`);
+      }
+    }
+  } finally {
+    session.dispose();
+  }
+  if (problems.length) fail(problems);
+  console.log(`✓ ${checked} source-verified contract(s) reproduce their artifact hash`);
+}
+
+async function attest(chain: Chain, argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      network: { type: 'string' },
+      contract: { type: 'string' },
+      commit: { type: 'string' },
+      search: { type: 'boolean', default: false },
+      max: { type: 'string', default: '20' },
+    },
+  });
+  if (!values.network || !values.contract) throw new Error('--network and --contract are required');
+  if (Boolean(values.commit) === values.search)
+    throw new Error('pass exactly one of --commit or --search');
+
+  const file = recordPath(chain, values.network);
+  const { deployment, errors } = readRecord(chain, file);
+  if (!deployment || errors.length) fail(errors);
+  const contract = deployment!.contracts.find((c) => c.name === values.contract);
+  if (!contract) throw new Error(`${values.contract} is not in ${path.relative(REPO_ROOT, file)}`);
+  if (contract.external) throw new Error(`${contract.name} is external: Wraith does not build it`);
+
+  const candidates = values.commit
+    ? [resolveSourceCommit(values.commit)]
+    : candidateCommits(chain, contract.deployment.timestamp, Number(values.max));
+  if (!candidates.length)
+    throw new Error('no candidate commits (shallow clone? try `git fetch --unshallow`)');
+
+  const session = new SourceSession();
+  let proven: string | null = null;
+  const misses: string[] = [];
+  try {
+    for (const commit of candidates) {
+      console.log(`… trying ${commit}`);
+      const why = await session.check(
+        chain,
+        { ...contract, sourceCommit: commit },
+        deployment!.rpcUrl,
+      );
+      if (!why) {
+        proven = commit;
+        break;
+      }
+      misses.push(`${commit}: ${why}`);
+    }
+  } finally {
+    session.dispose();
+  }
+  if (!proven) {
+    console.error(`No commit reproduces ${contract.name}; the record stays unverifiable.`);
+    fail(misses);
+  }
+  contract.sourceCommit = proven;
+  contract.provenance = { status: 'source-verified' };
+  const bad = validateDeployment(deployment!);
+  if (bad.length) fail(bad);
+  fs.writeFileSync(file, serialize(deployment));
+  console.log(`✓ ${contract.name} is source-verified at ${proven}`);
+  build();
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'build') return build();
   if (command === 'check') return check();
   if (command === 'verify') return verify();
+  if (command === 'verify-source') return verifySource(rest);
+  if (command === 'attest' && ['evm', 'stellar', 'solana', 'ckb'].includes(rest[0])) {
+    return attest(rest[0] as Chain, rest.slice(1));
+  }
+  if (command === 'subgraph') return subgraph(rest);
   if (command === 'record' && ['evm', 'stellar', 'solana', 'ckb'].includes(rest[0])) {
     return record(rest[0] as Chain, rest.slice(1));
   }

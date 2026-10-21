@@ -45,6 +45,19 @@
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/contract" }
+        },
+        "undeployed": {
+          "description": "Supported contracts this network deliberately has no deployment for. A network that records any contract must account for every contract its chain supports: each one is either in contracts or listed here with a reason. A name must not appear in both.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "reason"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "reason": { "type": "string", "minLength": 1 }
+            }
+          }
         }
       },
       "allOf": [
@@ -104,8 +117,18 @@
           "pattern": "^\\d+\\.\\d+\\.\\d+([-+][0-9A-Za-z.-]+)?$"
         },
         "sourceCommit": {
-          "description": "Git commit the artifact was built from, or null if unknown.",
+          "description": "Full 40-hex git commit the artifact was built from, or null if unknown. Non-null only together with provenance.status source-verified.",
           "oneOf": [{ "$ref": "#/$defs/commit" }, { "type": "null" }]
+        },
+        "provenance": {
+          "description": "Whether sourceCommit is proven. source-verified: building sourceCommit reproduces artifactHash (checked by `verify-source`). unverifiable: a historical record whose source commit cannot be proven; sourceCommit is null and reason says why. Required on every first-party (non-external) contract; enforced by the manifest tool.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "enum": ["source-verified", "unverifiable"] },
+            "reason": { "type": "string", "minLength": 1 }
+          }
         },
         "external": {
           "description": "True for third-party code Wraith depends on but does not build (e.g. ckb-auth).",
