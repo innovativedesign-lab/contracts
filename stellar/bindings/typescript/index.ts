@@ -8,4 +8,5 @@ export * as WraithNames from './wraith-names/src/index';
 export * as StealthSplitter from './stealth-splitter/src/index';
 export * as StealthVault from './stealth-vault/src/index';
 export * as WraithAssetPolicy from './wraith-asset-policy/src/index';
-export * as Governance from './governance/src/index';
+// Governance binding temporarily removed - needs to be regenerated with stellar CLI
+// export * as Governance from './governance/src/index';

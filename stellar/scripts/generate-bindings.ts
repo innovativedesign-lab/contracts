@@ -100,11 +100,12 @@ const CONTRACTS: ContractMetadata[] = [
     wasmName: 'wraith_asset_policy.wasm',
     envVar: 'WRAITH_ASSET_POLICY_CONTRACT_ID',
   },
-  {
-    crateName: 'governance',
-    wasmName: 'governance.wasm',
-    envVar: 'GOVERNANCE_CONTRACT_ID',
-  },
+  // Governance temporarily disabled - needs stellar CLI to generate proper binding
+  // {
+  //   crateName: 'governance',
+  //   wasmName: 'governance.wasm',
+  //   envVar: 'GOVERNANCE_CONTRACT_ID',
+  // },
 ];
 
 // Helper to check if a command exists in the system path
@@ -339,7 +340,8 @@ export * as WraithNames from './wraith-names/src/index';
 export * as StealthSplitter from './stealth-splitter/src/index';
 export * as StealthVault from './stealth-vault/src/index';
 export * as WraithAssetPolicy from './wraith-asset-policy/src/index';
-export * as Governance from './governance/src/index';
+// Governance binding temporarily disabled - needs to be regenerated with stellar CLI
+// export * as Governance from './governance/src/index';
 `;
 
   const indexFilePath = path.join(BINDINGS_DIR, 'index.ts');
